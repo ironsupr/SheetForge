@@ -1,4 +1,4 @@
-from fastapi import FastAPI, UploadFile, File, HTTPException
+from fastapi import FastAPI, UploadFile, File, HTTPException, Depends
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from typing import List
@@ -7,6 +7,9 @@ import shutil
 import processor
 import extractor
 import exporter
+from database import create_db_and_tables, engine, get_session
+from models import ExtractionRecord
+from sqlmodel import Session, select
 
 app = FastAPI(title="SheetForge API")
 
@@ -19,12 +22,16 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+@app.on_event("startup")
+def on_startup():
+    create_db_and_tables()
+
 @app.get("/")
 async def root():
     return {"message": "Welcome to SheetForge API"}
 
 @app.post("/process")
-async def process_document(file: UploadFile = File(...)):
+async def process_document(file: UploadFile = File(...), session: Session = Depends(get_session)):
     if not file.filename.endswith('.pdf'):
         raise HTTPException(status_code=400, detail="File must be a PDF")
     
@@ -40,10 +47,29 @@ async def process_document(file: UploadFile = File(...)):
         # 2. Extract financial data (LLM Mock)
         data = extractor.extract_financial_data(text)
         
-        return data.dict()
+        # 3. Save to database
+        record = ExtractionRecord.from_data(file.filename, data.dict())
+        session.add(record)
+        session.commit()
+        session.refresh(record)
+        
+        return {**data.dict(), "id": record.id}
     finally:
         if os.path.exists(temp_path):
             os.remove(temp_path)
+
+@app.get("/extractions", response_model=List[ExtractionRecord])
+async def get_extractions(session: Session = Depends(get_session)):
+    statement = select(ExtractionRecord).order_by(ExtractionRecord.timestamp.desc())
+    results = session.exec(statement).all()
+    return results
+
+@app.get("/extractions/{id}", response_model=ExtractionRecord)
+async def get_extraction(id: int, session: Session = Depends(get_session)):
+    record = session.get(ExtractionRecord, id)
+    if not record:
+        raise HTTPException(status_code=404, detail="Extraction not found")
+    return record
 
 @app.post("/export")
 async def export_data(data: dict):
